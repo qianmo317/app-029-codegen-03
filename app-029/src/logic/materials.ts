@@ -193,7 +193,8 @@ export function buildBom(project: Project, layout: LayoutResult, preset: Preset,
     qty: nesting.sheetCount,
     unit: '张',
     unitPriceCents: sheet.priceCents,
-    amountCents: nesting.sheetCount * sheet.priceCents
+    amountCents: nesting.sheetCount * sheet.priceCents,
+    refId: sheet.id
   })
   // 2) LED 模组
   if (panelMaterial.useLed) {
@@ -203,9 +204,10 @@ export function buildBom(project: Project, layout: LayoutResult, preset: Preset,
       qty: led.modules,
       unit: '只',
       unitPriceCents: module.priceCents,
-      amountCents: led.modules * module.priceCents
+      amountCents: led.modules * module.priceCents,
+      refId: module.id
     })
-    // 3) 电源
+    // 3) 电源（单价 = 分/W × 档位 W，四舍五入到分；refWatts 供按历史价目重取价）
     const psuUnitPrice = Math.round(preset.psu.pricePerWattCents * led.psuUnitW)
     materials.push({
       kind: 'psu',
@@ -213,7 +215,9 @@ export function buildBom(project: Project, layout: LayoutResult, preset: Preset,
       qty: led.psuCount,
       unit: '台',
       unitPriceCents: psuUnitPrice,
-      amountCents: led.psuCount * psuUnitPrice
+      amountCents: led.psuCount * psuUnitPrice,
+      refId: 'psu',
+      refWatts: led.psuUnitW
     })
   }
   // 4) 胶与配件（描边条在下面按描边字数单独计）
@@ -229,7 +233,8 @@ export function buildBom(project: Project, layout: LayoutResult, preset: Preset,
       qty,
       unit: c.unit,
       unitPriceCents: c.unitPriceCents,
-      amountCents: Math.round(qty * c.unitPriceCents)
+      amountCents: Math.round(qty * c.unitPriceCents),
+      refId: c.id
     })
   }
   if (outlinePerimeterM > 0) {
@@ -243,7 +248,8 @@ export function buildBom(project: Project, layout: LayoutResult, preset: Preset,
         qty,
         unit: trim.unit,
         unitPriceCents: trim.unitPriceCents,
-        amountCents: Math.round(qty * trim.unitPriceCents)
+        amountCents: Math.round(qty * trim.unitPriceCents),
+        refId: trim.id
       })
     }
   }
@@ -260,7 +266,8 @@ export function buildBom(project: Project, layout: LayoutResult, preset: Preset,
       qty,
       unit: l.unit,
       unitPriceCents: l.unitPriceCents,
-      amountCents: Math.round(qty * l.unitPriceCents)
+      amountCents: Math.round(qty * l.unitPriceCents),
+      refId: l.id
     })
   }
 
@@ -370,4 +377,15 @@ export function isActualRow(project: Project, row: CompareRow): boolean {
 
 export function yuan(cents: number): string {
   return (cents / 100).toFixed(2)
+}
+
+/**
+ * 用量精度（统一口径，归档/重算/导出共用，避免两处取整不一致）：
+ * 计件单位（支/套/个/台/张/只/字）向上取整为整数（不足一件按一件备料）；
+ * 其余（㎡/米）四舍五入保留 2 位小数。
+ * 金额永远在取整后的用量上计算：amount = Math.round(qtyRounded × unitPriceCents)。
+ */
+const WHOLE_UNITS = new Set(['支', '套', '个', '台', '张', '只', '字'])
+export function roundQty(rawQty: number, unit: string): number {
+  return WHOLE_UNITS.has(unit) ? Math.ceil(rawQty - 1e-9) : Math.round(rawQty * 100) / 100
 }

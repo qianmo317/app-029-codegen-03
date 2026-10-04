@@ -7,6 +7,7 @@ import materialsData from '../data/materials.json'
 import type { Preset } from './materials'
 import { defaultProject } from './layout'
 import type { Project } from './types'
+import { commitPresetPrices, ensureBaseline, type PriceVersion } from './archive'
 
 const KEY_PROJECTS = 'app029.projects.v1'
 const KEY_PRESET = 'app029.preset.v1'
@@ -103,19 +104,49 @@ export function defaultPresetDeep(): Preset {
   return JSON.parse(JSON.stringify(materialsData)) as Preset
 }
 
+let baselineEnsured = false
+
 export function loadPreset(): Preset {
   const saved = readJson<Partial<Preset> | null>(KEY_PRESET, null)
-  if (!saved) return defaultPresetDeep()
-  return mergePreset(defaultPresetDeep(), saved)
+  const merged = saved ? mergePreset(defaultPresetDeep(), saved) : defaultPresetDeep()
+  // 首次载入：若本机还没有价目归档，把当前在用价目存成基线版（幂等，只做一次）
+  if (!baselineEnsured) {
+    baselineEnsured = true
+    try {
+      ensureBaseline(merged)
+    } catch {
+      // localStorage 不可用时不影响功能
+    }
+  }
+  return merged
 }
 
-export function savePreset(preset: Preset): void {
+/**
+ * 保存预设。
+ * @param commitArchive true（在「材质与工艺」页显式点保存/恢复默认）时：
+ *   若单价有改动，先存改动前那一版（基线/上一版已在归档里），再存改动后的新价目版本；
+ *   false（会话内自动保存项目时顺带落盘预设）只覆盖当前预设，不提新版本，
+ *   避免「改个字距也产生一个价目版本」。
+ */
+export function savePreset(preset: Preset, commitArchive = false): { version: PriceVersion; created: boolean } | null {
   writeJson(KEY_PRESET, preset)
+  if (!commitArchive) return null
+  try {
+    return commitPresetPrices(preset)
+  } catch {
+    return null
+  }
 }
 
 export function resetPreset(): Preset {
   const fresh = defaultPresetDeep()
   writeJson(KEY_PRESET, fresh)
+  // 显式恢复出厂价：若与当前价目不同，同样产生一个新版本，保留可追溯性
+  try {
+    commitPresetPrices(fresh, { note: '恢复出厂默认价目' })
+  } catch {
+    // 忽略归档失败
+  }
   return fresh
 }
 

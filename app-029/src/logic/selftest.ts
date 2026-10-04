@@ -10,6 +10,23 @@ import { computeLayout, defaultProject, textToItems, type LayoutResult } from '.
 import { assertBomSum, buildBom, compareMaterials, defaultPreset, type Preset } from './materials'
 import { nestPieces, type Piece } from './nesting'
 import { runBlockCount, type BlockCountResult } from './testRunner'
+import {
+  archiveStorageBytes,
+  assertDiffSums,
+  commitPresetPrices,
+  compareQuotes,
+  createMemoryKv,
+  ensureBaseline,
+  extractPriceItems,
+  getPriceVersion,
+  issueQuote,
+  listIssuedQuotes,
+  listPriceVersions,
+  queryIssuedQuotes,
+  quoteVersionMissing,
+  recalcQuote,
+  type KvStore
+} from './archive'
 import type { LayoutDef, Project } from './types'
 import type { Ring } from './geometry'
 import { pointInRings } from './geometry'
@@ -94,6 +111,235 @@ export function minChordSweep(rings: Ring[], axis: 'h' | 'v', from: number, to: 
     }
   }
   return Number.isFinite(best) ? best : 0
+}
+
+function clonePreset(p: Preset): Preset {
+  return JSON.parse(JSON.stringify(p))
+}
+
+/**
+ * A11 报价归档自检（纯内存 KV，不碰浏览器 localStorage，不依赖字体几何）。
+ * 覆盖：基线/调价版本、当天生效取价、出单冻结后调价不影响、用量差与单价差拆分逐分对平、
+ * 旧单（无版本）重算与版本缺失重算（不盖原件、缺失价项列出）、客户/时间段查询、旧存档缺字段兼容。
+ */
+async function checkArchive(): Promise<CheckResult> {
+  const evidence: string[] = []
+  const fails: string[] = []
+  const kv: KvStore = createMemoryKv()
+
+  // 构造一个最小项目 + BOM（与 A7 同排版，需要字体；字体在 A1/A3 已确保加载）
+  const p = makeProject('acc11', '广告招牌制作', 300)
+  const lay: LayoutResult = computeLayout(p.layout, { autoSize: true })
+  const preset0 = clonePreset(defaultPreset)
+  const bom0 = buildBom(p, lay, preset0)
+
+  // 1) 首次提交：建基线；再提交相同价目不重复建版
+  const t1 = Date.parse('2026-09-01T10:00:00')
+  const base = ensureBaseline(preset0, t1, kv)
+  const again = commitPresetPrices(preset0, { now: t1 + 1000 }, kv)
+  if (base.reason !== 'baseline' || again.created) fails.push('基线/重复提交判定错误')
+  evidence.push(`基线版本：${base.id.slice(-6)}，${base.items.length} 个价项，生效 ${new Date(base.effectiveAt).toISOString().slice(0, 10)}`)
+
+  // 2) 出第一张单（按当天生效版本取价并冻结）
+  const doc0 = issueQuote(
+    {
+      project: p,
+      materials: bom0.materials,
+      totalCents: bom0.totalCents,
+      now: t1 + 3600_000,
+      snapshot: { projectName: p.name, customer: '测试客户甲', panelText: '', fontText: '', layoutText: '', notes: [] }
+    },
+    kv
+  )
+  if (doc0.priceVersionId !== base.id) fails.push('单据未引用当天生效版本')
+
+  // 3) 调价：板材 +1000 分、一个加工项 +500 分，提交新版本
+  const preset1 = clonePreset(preset0)
+  preset1.acrylicSheets[0].priceCents += 1000
+  preset1.labor[0].unitPriceCents += 500
+  const t2 = Date.parse('2026-10-15T10:00:00')
+  const v2 = commitPresetPrices(preset1, { now: t2, note: '测试调价' }, kv).version
+  if (v2.changes.length !== 2) fails.push(`改动项应为 2，实际 ${v2.changes.length}`)
+  evidence.push(`调价版本 ${v2.id.slice(-6)}：${v2.changes.map((c) => `${c.name} ${c.beforeCents}→${c.afterCents}`).join('；')}`)
+
+  // 4) 出第二张单（同样排版、同样用量 → 只有单价差，用量差为 0；证明旧单没被影响）
+  const bom1 = buildBom(p, lay, preset1)
+  const doc1 = issueQuote(
+    {
+      project: p,
+      materials: bom1.materials,
+      totalCents: bom1.totalCents,
+      now: t2 + 3600_000,
+      snapshot: { projectName: p.name, customer: '测试客户甲', panelText: '', fontText: '', layoutText: '', notes: [] }
+    },
+    kv
+  )
+  const stored0 = listIssuedQuotes(kv).find((d) => d.id === doc0.id)
+  if (!stored0 || stored0.totalCents !== bom0.totalCents) fails.push('调价后第一张单的金额被改动（未冻结）')
+  evidence.push(`调价后：旧单仍为 ${doc0.totalCents} 分，新单 ${doc1.totalCents} 分，差 ${doc1.totalCents - doc0.totalCents} 分`)
+
+  // 5) 逐项比价：用量差必须为 0（排版没变），总差全部是单价差，逐分对平
+  const diff1 = compareQuotes(doc0, doc1)
+  const sum1 = assertDiffSums(diff1)
+  if (!sum1.ok) fails.push(sum1.message)
+  if (diff1.qtyDeltaTotal !== 0) fails.push(`同用量下用量差应为 0，实际 ${diff1.qtyDeltaTotal}`)
+  if (diff1.priceDeltaTotal !== diff1.totalDeltaCents) fails.push('同用量下单价差应等于总差')
+  evidence.push(sum1.message)
+
+  // 6) 构造一张用量不同的单（手工改一行数量），同时再调一次价，验证用量差/单价差拆分
+  const preset2 = clonePreset(preset1)
+  const glue = preset2.consumables.find((c) => c.id === 'glue')
+  if (glue) glue.unitPriceCents += 200 // 3800 → 4000
+  const t3 = Date.parse('2026-11-01T10:00:00')
+  commitPresetPrices(preset2, { now: t3 }, kv)
+  const doc2Lines = doc1.lines.map((l) => (l.refId === 'glue' ? { ...l, qty: l.qty + 2, amountCents: Math.round((l.qty + 2) * l.unitPriceCents) } : l))
+  const doc2 = issueQuote(
+    {
+      project: p,
+      materials: doc2Lines.map((l) => ({
+        kind: l.group,
+        spec: l.spec,
+        qty: l.qty,
+        unit: l.unit,
+        unitPriceCents: l.unitPriceCents,
+        amountCents: l.amountCents,
+        refId: l.refId,
+        refWatts: l.refWatts
+      })),
+      totalCents: doc2Lines.reduce((s, l) => s + l.amountCents, 0),
+      now: t3 + 3600_000,
+      snapshot: { projectName: p.name, customer: '测试客户甲', panelText: '', fontText: '', layoutText: '', notes: [] }
+    },
+    kv
+  )
+  // doc3：同用量（+2 后的数量）但单价已为 4000，验证「只单价变」不受影响
+  const doc3Lines = doc2.lines.map((l) =>
+    l.refId === 'glue' ? { ...l, unitPriceCents: 4000, amountCents: Math.round(l.qty * 4000) } : l
+  )
+  const doc3 = issueQuote(
+    {
+      project: p,
+      materials: doc3Lines.map((l) => ({
+        kind: l.group,
+        spec: l.spec,
+        qty: l.qty,
+        unit: l.unit,
+        unitPriceCents: l.unitPriceCents,
+        amountCents: l.amountCents,
+        refId: l.refId,
+        refWatts: l.refWatts
+      })),
+      totalCents: doc3Lines.reduce((s, l) => s + l.amountCents, 0),
+      now: t3 + 7200_000,
+      snapshot: { projectName: p.name, customer: '测试客户乙', panelText: '', fontText: '', layoutText: '', notes: [] }
+    },
+    kv
+  )
+  // doc1（旧用量、旧价 3800）→ doc2（用量 +2、仍按 3800 出）：纯用量差
+  const diffQty = compareQuotes(doc1, doc2)
+  const sumQty = assertDiffSums(diffQty)
+  if (!sumQty.ok) fails.push(sumQty.message)
+  const glueQtyRow = diffQty.lines.find((r) => r.key.includes('glue'))
+  const expectQtyOnly = Math.round(2 * 3800) // +7600，且单价差为 0
+  if (!glueQtyRow || glueQtyRow.qtyDeltaCents !== expectQtyOnly || glueQtyRow.priceDeltaCents !== 0) {
+    fails.push(`纯用量变：用量差应 ${expectQtyOnly}、单价差应 0，实际 ${glueQtyRow?.qtyDeltaCents}/${glueQtyRow?.priceDeltaCents}`)
+  }
+  // doc2（用量+2、3800）→ doc3（同用量、4000）：纯单价差
+  const diff2 = compareQuotes(doc2, doc3)
+  const sum2 = assertDiffSums(diff2)
+  if (!sum2.ok) fails.push(sum2.message)
+  const glueRow = diff2.lines.find((r) => r.key.includes('glue'))
+  if (!glueRow || glueRow.qtyDeltaCents !== 0) fails.push(`同用量下用量差应为 0，实际 ${glueRow?.qtyDeltaCents}`)
+  if (glueRow && glueRow.priceDeltaCents !== glueRow.deltaCents) fails.push('纯单价变：单价差应等于行差')
+  evidence.push(
+    `胶条：用量+2（按旧价3800折）用量差 +${expectQtyOnly} 分；同用量调价 3800→4000 单价差 ${glueRow?.priceDeltaCents} 分（${glueRow?.qtyB} 支×200）`
+  )
+  evidence.push(sumQty.message); evidence.push(sum2.message)
+
+  // doc1（旧用量、3800）→ doc3（用量+2、4000）：用量与单价同时变。
+  // 用量差按旧价折 = 2×3800 = 7600；行差 = 5×4000 − 3×3800 = 8600；交叉项 (5−3)×(4000−3800)=400 归入单价差
+  const diffBoth = compareQuotes(doc1, doc3)
+  const sumBoth = assertDiffSums(diffBoth)
+  if (!sumBoth.ok) fails.push(sumBoth.message)
+  const bothRow = diffBoth.lines.find((r) => r.key.includes('glue'))
+  if (!bothRow || bothRow.status !== 'both' || bothRow.qtyDeltaCents !== 7600 || bothRow.priceDeltaCents !== 1000 || bothRow.deltaCents !== 8600) {
+    fails.push(`双变拆分错误：期望 用量差7600/单价差1000/行差8600，实际 ${bothRow?.qtyDeltaCents}/${bothRow?.priceDeltaCents}/${bothRow?.deltaCents}`)
+  }
+  evidence.push(`双变行：用量差 7600 + 单价差 1000（含交叉 400）= 行差 8600，逐分对平`)
+
+  // 7) 旧单重算（无 versionId）与「版本缺失」重算：不盖原件、缺失价项列出
+  const legacy = JSON.parse(JSON.stringify(doc0)) as typeof doc0
+  legacy.id = 'bqlegacy'
+  legacy.priceVersionId = null
+  legacy.priceEffectiveAt = null
+  legacy.recalcKind = 'original'
+  legacy.recalcOfId = null
+  // 手工塞进存储（模拟升级前留下的旧单）
+  const rawDocs = JSON.parse(kv.getItem('app029.issuedQuotes.v1') ?? '[]') as unknown[]
+  rawDocs.push(legacy)
+  kv.setItem('app029.issuedQuotes.v1', JSON.stringify(rawDocs))
+  const legacyLoaded = listIssuedQuotes(kv).find((d) => d.id === 'bqlegacy')
+  if (!legacyLoaded) {
+    fails.push('旧单未能读出')
+  } else {
+    const r1 = recalcQuote(legacyLoaded, preset2, 'legacy-recalc', { kv, now: t3 + 9000_000 })
+    if (r1.quote.recalcOfId !== legacyLoaded.id || legacyLoaded.totalCents !== bom0.totalCents) fails.push('重算覆盖了原件')
+    // 手工删除一个价项，验证 missingRefs
+    const preset3 = clonePreset(preset2)
+    preset3.consumables = preset3.consumables.filter((c) => c.id !== 'glue')
+    const r2 = recalcQuote(legacyLoaded, preset3, 'missing-version-recalc', { kv, now: t3 + 10800_000 })
+    if (!r2.missingRefs.some((m) => m.includes('glue'))) fails.push('缺失价项未列入 missingRefs')
+    evidence.push(`旧单重算：原件 ${legacyLoaded.totalCents} 分未动；重算 ${r1.quote.totalCents} 分；删价项后重算缺失 ${r2.missingRefs.length} 项`)
+  }
+  // 版本缺失检测：造一个引用不存在版本的单
+  if (quoteVersionMissing({ ...doc0, priceVersionId: 'pv_nope' })) {
+    evidence.push('版本缺失检测：引用已删除版本的单据被正确识别')
+  } else {
+    fails.push('版本缺失未识别')
+  }
+
+  // 8) 按客户 / 时间段检索
+  const byCust = queryIssuedQuotes({ customer: '客户乙', includeRecalc: true }, kv)
+  const byTime = queryIssuedQuotes({ from: t3, to: t3 + 10_000_000, includeRecalc: true }, kv)
+  if (!byCust.every((d) => d.snapshot.customer.includes('客户乙'))) fails.push('客户过滤错误')
+  if (byTime.some((d) => d.issuedAt < t3)) fails.push('时间段过滤错误')
+  evidence.push(`检索：客户「乙」${byCust.length} 张；11-01 时间段 ${byTime.length} 张（含重算件）`)
+
+  // 9) 旧存档缺字段兼容：写一个「老格式（无 schema/无 customer/行无 refId）」对象再读出
+  const oldShape = {
+    id: 'bqoldshape',
+    no: 'BJ-OLD-1',
+    projectId: p.id,
+    issuedAt: t1,
+    priceVersionId: null,
+    lines: [{ group: 'labor', spec: '老式加工费', qty: 1, unit: '字', unitPriceCents: 100, amountCents: 100 }],
+    totalCents: 100,
+    snapshot: { projectName: '老项目' }
+  }
+  kv.setItem(
+    'app029.issuedQuotes.v1',
+    JSON.stringify([...(JSON.parse(kv.getItem('app029.issuedQuotes.v1') ?? '[]') as unknown[]), oldShape])
+  )
+  const parsed = listIssuedQuotes(kv).find((d) => d.id === 'bqoldshape')
+  if (!parsed || parsed.recalcKind !== 'original' || parsed.snapshot.customer !== '' || parsed.totalCents !== 100) {
+    fails.push('旧格式单据兼容解析失败')
+  } else {
+    evidence.push('旧格式单据（缺 schema/customer/refId）按默认值补齐后可正常打开')
+  }
+
+  // 10) 版本快照在本机的占用 & 基线重放：任意单据版本都可 O(1) 取回
+  const bytes = archiveStorageBytes(kv)
+  const back = getPriceVersion(doc1.priceVersionId, kv)
+  if (!back || back.items.length !== extractPriceItems(preset1).length) fails.push('历史版本快照取回失败')
+  evidence.push(`归档占用约 ${(bytes / 1024).toFixed(1)} KB（${listPriceVersions(kv).length} 个版本）；任一单据版本可直接取回，无需沿链回放`)
+
+  return {
+    id: 'A11',
+    title: '报价归档：价目整份快照、出单冻结后调价不影响、两单用量差/单价差逐分对平、旧单重算不盖原件、旧存档兼容',
+    pass: fails.length === 0,
+    detail: fails.length === 0 ? '通过' : fails.join('；'),
+    evidence
+  }
 }
 
 export async function runAcceptance(preset: Preset = defaultPreset): Promise<AcceptanceReport> {
@@ -377,6 +623,9 @@ export async function runAcceptance(preset: Preset = defaultPreset): Promise<Acc
       evidence: cmp.map((c) => `${c.name}：面板 ${(c.panelCents / 100).toFixed(2)} + LED ${(c.ledCents / 100).toFixed(2)} + 电源 ${(c.psuCents / 100).toFixed(2)} + 配件 ${(c.accessoryCents / 100).toFixed(2)} + 加工 ${(c.laborCents / 100).toFixed(2)} = ¥${(c.totalCents / 100).toFixed(2)}`)
     })
   }
+
+  // ---------- 11. 报价归档：版本快照、冻结出单、用量差/单价差拆分、旧单重算、逐分对平、旧存档兼容 ----------
+  checks.push(await checkArchive())
 
   const blockScan = await runBlockCount()
   checks.push({

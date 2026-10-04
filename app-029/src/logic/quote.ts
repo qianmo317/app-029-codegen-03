@@ -10,6 +10,7 @@ import { yuan } from './materials'
 import type { LayoutResult } from './layout'
 import { alignLabel, mountingLabel } from './layout'
 import type { Project } from './types'
+import type { IssuedQuote } from './archive'
 
 export function bomGroupLabel(kind: string): string {
   switch (kind) {
@@ -29,21 +30,44 @@ export function bomGroupLabel(kind: string): string {
 export interface QuoteDoc {
   title: string
   projectName: string
+  customer: string
   date: string
   validUntil: string
   panelText: string
   fontText: string
   layoutText: string
+  /** 取价说明（价目版本/生效日期/重算标记），导出单据抬头必带 */
+  priceLine: string
+  badge: string
   rows: Array<{ group: string; spec: string; qty: string; unit: string; unitPrice: string; amount: string }>
   total: string
   notes: string[]
   footer: string
 }
 
-export function buildQuoteDoc(project: Project, layout: LayoutResult, bom: BomResult, fontLabel: string): QuoteDoc {
-  const now = new Date()
+const fmtDate = (d: Date): string =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+
+/**
+ * 单据抬头取价口径（统一文案，界面/Excel/CSV/打印共用）：
+ * - 原件：「按 YYYY-MM-DD 生效价目（版本号）取价，出单后价格再改不影响本单」
+ * - 重算件：显式「重算」红字提示，并列出无法取价的条目。
+ */
+function priceLineOf(issued?: IssuedQuote): string {
+  if (!issued) return '按当天生效价目取价；出单归档后即冻结，之后调价不影响已出单据。'
+  const eff = issued.priceEffectiveAt ? fmtDate(new Date(issued.priceEffectiveAt)) : '未知日期'
+  if (issued.recalcKind === 'legacy-recalc') {
+    return `【重算】旧单无价目归档，本页/本文件金额按当时用量 × ${eff} 价目重算，非原始报价；原件未被覆盖。`
+  }
+  if (issued.recalcKind === 'missing-version-recalc') {
+    return `【重算】原引用价目版本（${issued.priceVersionId ?? '?'}）在本机已缺失，金额按当时用量 × ${eff} 价目重算，非原始报价；原件未被覆盖。`
+  }
+  return `按 ${eff} 生效价目取价（价目版本 ${issued.priceVersionId ? issued.priceVersionId.slice(-6) : '—'}）；本单已冻结，之后调价不影响。`
+}
+
+export function buildQuoteDoc(project: Project, layout: LayoutResult, bom: BomResult, fontLabel: string, issued?: IssuedQuote): QuoteDoc {
+  const now = new Date(issued?.issuedAt ?? Date.now())
   const valid = new Date(now.getTime() + 30 * 24 * 3600 * 1000)
-  const fmt = (d: Date): string => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
   const rows = bom.materials.map((m) => ({
     group: bomGroupLabel(m.kind),
     spec: m.spec,
@@ -53,24 +77,28 @@ export function buildQuoteDoc(project: Project, layout: LayoutResult, bom: BomRe
     amount: yuan(m.amountCents)
   }))
   return {
-    title: '招牌字制作报价单',
+    title: issued && issued.recalcKind !== 'original' ? '招牌字报价单（重算版）' : '招牌字制作报价单',
     projectName: project.name,
-    date: fmt(now),
-    validUntil: fmt(valid),
+    customer: project.customer ?? '',
+    date: fmtDate(now),
+    validUntil: fmtDate(valid),
     panelText: `${project.layout.panel.wMm}×${project.layout.panel.hMm}mm（边框 ${project.layout.panel.frameMm}mm，${mountingLabel(
       project.layout.panel.mounting
     )}）`,
     fontText: `${fontLabel}　字重 ${project.layout.settings.weight}　字号 ${layout.sizeMm}mm（${alignLabel(project.layout.settings.align)}）`,
     layoutText: `占宽 ${layout.occupiedW}mm × 占高 ${layout.occupiedH}mm；左右留边 ${layout.margins.left}/${layout.margins.right}mm；视觉间距极差 ${layout.gapSpread}mm`,
+    priceLine: priceLineOf(issued),
+    badge: issued && issued.recalcKind !== 'original' ? '重算' : '',
     rows,
     total: yuan(bom.totalCents),
     notes: [
+      ...(issued?.missingRefs?.length ? [`重算时以下条目在当前价目中已缺失，未计入金额：${issued.missingRefs.join('；')}`] : []),
       `面板材料：${bom.panelMaterial.name}（${bom.panelMaterial.desc}）`,
       `亚克力拼版：${bom.nesting.sheetCount} 张 ${bom.sheet.spec}，利用率 ${(bom.nesting.utilization * 100).toFixed(1)}%`,
       `LED：布点长度 ${bom.led.perimeterTotalMm}mm，模组 ${bom.led.modules} 只，额定功率 ${bom.led.ratedW}W，建议电源 ${bom.led.suggestedPsu}`,
       bom.led.note
     ].filter((s) => !!s),
-    footer: '本报价基于当前材料单价，有效期 30 天；含材料与加工费，不含安装与运输。'
+    footer: '金额一律按整数「分」计算（元 = 分 ÷ 100，两位小数），用量计件向上取整、㎡/米保留 2 位小数；本报价含材料与加工费，不含安装与运输。'
   }
 }
 
@@ -90,12 +118,21 @@ function esc(s: string): string {
 }
 
 /** 导出 Excel（.xls，Excel/WPS 可直接打开） */
-export function exportQuoteXls(project: Project, layout: LayoutResult, bom: BomResult, fontLabel: string, compare: CompareRow[]): void {
-  const doc = buildQuoteDoc(project, layout, bom, fontLabel)
+export function exportQuoteXls(
+  project: Project,
+  layout: LayoutResult,
+  bom: BomResult,
+  fontLabel: string,
+  compare: CompareRow[],
+  issued?: IssuedQuote
+): void {
+  const doc = buildQuoteDoc(project, layout, bom, fontLabel, issued)
   const table = `
   <table border="1">
-    <tr><th colspan="6">${esc(doc.title)}</th></tr>
-    <tr><td>项目</td><td colspan="5">${esc(doc.projectName)}</td></tr>
+    <tr><th colspan="6">${esc(doc.title)}${doc.badge ? `（${esc(doc.badge)}）` : ''}</th></tr>
+    <tr><td>单号</td><td colspan="2">${esc(issued?.no ?? '')}</td><td>报价日期</td><td colspan="2">${esc(doc.date)}（有效期至 ${esc(doc.validUntil)}）</td></tr>
+    <tr><td>客户</td><td colspan="2">${esc(doc.customer)}</td><td>项目</td><td colspan="2">${esc(doc.projectName)}</td></tr>
+    <tr><td>取价口径</td><td colspan="5">${esc(doc.priceLine)}</td></tr>
     <tr><td>门头尺寸</td><td colspan="5">${esc(doc.panelText)}</td></tr>
     <tr><td>字体/排版</td><td colspan="5">${esc(doc.fontText)}</td></tr>
     <tr><td>排版结果</td><td colspan="5">${esc(doc.layoutText)}</td></tr>
@@ -109,7 +146,9 @@ export function exportQuoteXls(project: Project, layout: LayoutResult, bom: BomR
       )
       .join('\n')}
     <tr><td colspan="5">合计</td><td>${esc(doc.total)}</td></tr>
-    <tr><th colspan="6">多材质成本对照（元）</th></tr>
+    ${
+      compare.length
+        ? `<tr><th colspan="6">多材质成本对照（元）</th></tr>
     <tr><th>材质</th><th>说明</th><th>面板</th><th>LED+电源</th><th>配件</th><th>合计</th></tr>
     ${compare
       .map(
@@ -118,13 +157,15 @@ export function exportQuoteXls(project: Project, layout: LayoutResult, bom: BomR
             c.ledCents + c.psuCents
           )}</td><td>${yuan(c.accessoryCents + c.laborCents)}</td><td>${yuan(c.totalCents)}</td></tr>`
       )
-      .join('\n')}
+      .join('\n')}`
+        : ''
+    }
     <tr><th colspan="6">工艺说明</th></tr>
     ${doc.notes.map((n) => `<tr><td colspan="6">${esc(n)}</td></tr>`).join('\n')}
     <tr><td colspan="6">${esc(doc.footer)}</td></tr>
   </table>`
   const html = `<html><head><meta charset="utf-8"></head><body>${table}</body></html>`
-  download(`${project.name || '招牌'}报价单.xls`, new Blob([`\ufeff${html}`], { type: 'application/vnd.ms-excel;charset=utf-8' }))
+  download(`${project.name || '招牌'}报价单${issued ? `_${issued.no}` : ''}.xls`, new Blob([`\ufeff${html}`], { type: 'application/vnd.ms-excel;charset=utf-8' }))
 }
 
 /** 导出工艺卡（CSV，供车间流转；PDF 走浏览器打印） */
@@ -161,4 +202,61 @@ export function exportProcessCardCsv(project: Project, layout: LayoutResult, bom
   lines.push(`板数,${bom.nesting.sheetCount}`)
   lines.push(`利用率,${(bom.nesting.utilization * 100).toFixed(1)}%`)
   download(`${project.name || '招牌'}工艺卡.csv`, new Blob([`\ufeff${lines.join('\n')}`], { type: 'text/csv;charset=utf-8' }))
+}
+/** 取价口径文案（归档页打印/导出复用） */
+export function issuedPriceLine(q: IssuedQuote): string {
+  return priceLineOf(q)
+}
+
+/** 由已归档冻结单据导出 Excel（行明细全部取存档值，不重新算价） */
+export function exportIssuedQuoteXls(
+  issued: IssuedQuote,
+  rows: Array<{ group: string; spec: string; qty: string; unit: string; unitPrice: string; amount: string }>,
+  opts: { customer: string; projectName: string; panelText: string; fontText: string; layoutText: string }
+): void {
+  const date = fmtDate(new Date(issued.issuedAt))
+  const valid = fmtDate(new Date(issued.issuedAt + 30 * 24 * 3600 * 1000))
+  const badge = issued.recalcKind !== 'original' ? '（重算）' : ''
+  const priceLine = priceLineOf(issued)
+  const table = `
+  <table border="1">
+    <tr><th colspan="6">招牌字制作报价单${esc(badge)}</th></tr>
+    <tr><td>单号</td><td colspan="2">${esc(issued.no)}</td><td>报价日期</td><td colspan="2">${esc(date)}（有效期至 ${esc(valid)}）</td></tr>
+    <tr><td>客户</td><td colspan="2">${esc(opts.customer)}</td><td>项目</td><td colspan="2">${esc(opts.projectName)}</td></tr>
+    <tr><td>取价口径</td><td colspan="5">${esc(priceLine)}</td></tr>
+    <tr><td>门头尺寸</td><td colspan="5">${esc(opts.panelText)}</td></tr>
+    <tr><td>字体/排版</td><td colspan="5">${esc(opts.fontText)}</td></tr>
+    <tr><td>排版结果</td><td colspan="5">${esc(opts.layoutText)}</td></tr>
+    <tr><th>类别</th><th>规格/说明</th><th>数量</th><th>单位</th><th>单价(元)</th><th>金额(元)</th></tr>
+    ${rows
+      .map(
+        (r) =>
+          `<tr><td>${esc(r.group)}</td><td>${esc(r.spec)}</td><td>${esc(r.qty)}</td><td>${esc(r.unit)}</td><td>${esc(
+            r.unitPrice
+          )}</td><td>${esc(r.amount)}</td></tr>`
+      )
+      .join('\n')}
+    <tr><td colspan="5">合计</td><td>${yuan(issued.totalCents)}</td></tr>
+    ${
+      issued.missingRefs?.length
+        ? `<tr><td colspan="6">未取价条目（重算时当前价目已缺失，金额未计入）：${esc(issued.missingRefs.join('；'))}</td></tr>`
+        : ''
+    }
+  </table>`
+  const html = `<html><head><meta charset="utf-8"></head><body>${table}</body></html>`
+  download(`${opts.projectName || '招牌'}报价单_${issued.no}.xls`, new Blob([`﻿${html}`], { type: 'application/vnd.ms-excel;charset=utf-8' }))
+}
+
+/** 已归档单据行 → 导出表格行（字符串化，保留存档精度） */
+export function issuedRows(
+  q: IssuedQuote
+): Array<{ group: string; spec: string; qty: string; unit: string; unitPrice: string; amount: string }> {
+  return q.lines.map((l) => ({
+    group: bomGroupLabel(l.group),
+    spec: l.spec,
+    qty: String(l.qty),
+    unit: l.unit,
+    unitPrice: yuan(l.unitPriceCents),
+    amount: yuan(l.amountCents)
+  }))
 }

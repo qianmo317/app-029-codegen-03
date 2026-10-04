@@ -90,7 +90,9 @@ export function useSession(projectRef: Ref<Project | null>): Session {
   }
 
   const savePresetNow = (): void => {
-    savePreset(preset.value)
+    // 会话内预设跟随保存只覆盖当前参数，不产生价目归档版本
+    // （价目版本只在「材质与工艺」页显式保存、且单价确实改动时产生）
+    savePreset(preset.value, false)
   }
 
   // 项目参数变化即自动保存

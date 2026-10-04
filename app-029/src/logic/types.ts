@@ -82,6 +82,10 @@ export interface Material {
   unit: string
   unitPriceCents: number
   amountCents: number
+  /** 取价引用：对应价目版本里的稳定条目 id（板材/模组/配件/加工为各自 id，电源为 'psu'） */
+  refId?: string
+  /** 电源单价按「分/W × 实际档位 W」折算时，记录折算用的瓦数 */
+  refWatts?: number
 }
 
 export interface BBox {
@@ -120,6 +124,8 @@ export interface GlyphInfo {
 export interface Project {
   id: string
   name: string
+  /** 客户名称（报价归档按客户检索；旧项目缺省为空串） */
+  customer?: string
   layout: LayoutDef
   led: LedCfg
   /** 面板材料预设 id（见 materials.json 的 panelMaterials） */
