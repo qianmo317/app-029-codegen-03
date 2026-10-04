@@ -4,6 +4,7 @@
  */
 
 import materialsData from '../data/materials.json'
+import { recordPriceChange, type PriceVersion } from './archive'
 import type { Preset } from './materials'
 import { defaultProject } from './layout'
 import type { Project } from './types'
@@ -109,13 +110,20 @@ export function loadPreset(): Preset {
   return mergePreset(defaultPresetDeep(), saved)
 }
 
-export function savePreset(preset: Preset): void {
+/**
+ * 保存预设。材料/加工单价有改动时自动留痕：先把当时那一份价目归档，改完再存一份新的
+ * （见 archive.ts 的存储策略说明）。返回新归档的价目版本（价目无变化时为 null）。
+ */
+export function savePreset(preset: Preset): PriceVersion | null {
+  const prev = loadPreset()
+  const version = recordPriceChange(prev, preset)
   writeJson(KEY_PRESET, preset)
+  return version
 }
 
 export function resetPreset(): Preset {
   const fresh = defaultPresetDeep()
-  writeJson(KEY_PRESET, fresh)
+  savePreset(fresh)
   return fresh
 }
 

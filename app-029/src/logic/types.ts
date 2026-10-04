@@ -82,6 +82,8 @@ export interface Material {
   unit: string
   unitPriceCents: number
   amountCents: number
+  /** 对应的价目条目 id（见 archive.ts 的 PriceBook），供归档/对比/重算对齐用 */
+  priceId?: string
 }
 
 export interface BBox {
@@ -120,6 +122,8 @@ export interface GlyphInfo {
 export interface Project {
   id: string
   name: string
+  /** 客户名称（报价归档按客户检索用；可选，老项目没有该字段也能正常打开） */
+  customer?: string
   layout: LayoutDef
   led: LedCfg
   /** 面板材料预设 id（见 materials.json 的 panelMaterials） */

@@ -193,7 +193,8 @@ export function buildBom(project: Project, layout: LayoutResult, preset: Preset,
     qty: nesting.sheetCount,
     unit: '张',
     unitPriceCents: sheet.priceCents,
-    amountCents: nesting.sheetCount * sheet.priceCents
+    amountCents: nesting.sheetCount * sheet.priceCents,
+    priceId: `sheet:${sheet.id}`
   })
   // 2) LED 模组
   if (panelMaterial.useLed) {
@@ -203,7 +204,8 @@ export function buildBom(project: Project, layout: LayoutResult, preset: Preset,
       qty: led.modules,
       unit: '只',
       unitPriceCents: module.priceCents,
-      amountCents: led.modules * module.priceCents
+      amountCents: led.modules * module.priceCents,
+      priceId: `led:${module.id}`
     })
     // 3) 电源
     const psuUnitPrice = Math.round(preset.psu.pricePerWattCents * led.psuUnitW)
@@ -213,7 +215,8 @@ export function buildBom(project: Project, layout: LayoutResult, preset: Preset,
       qty: led.psuCount,
       unit: '台',
       unitPriceCents: psuUnitPrice,
-      amountCents: led.psuCount * psuUnitPrice
+      amountCents: led.psuCount * psuUnitPrice,
+      priceId: 'psu'
     })
   }
   // 4) 胶与配件（描边条在下面按描边字数单独计）
@@ -229,7 +232,8 @@ export function buildBom(project: Project, layout: LayoutResult, preset: Preset,
       qty,
       unit: c.unit,
       unitPriceCents: c.unitPriceCents,
-      amountCents: Math.round(qty * c.unitPriceCents)
+      amountCents: Math.round(qty * c.unitPriceCents),
+      priceId: `cons:${c.id}`
     })
   }
   if (outlinePerimeterM > 0) {
@@ -243,7 +247,8 @@ export function buildBom(project: Project, layout: LayoutResult, preset: Preset,
         qty,
         unit: trim.unit,
         unitPriceCents: trim.unitPriceCents,
-        amountCents: Math.round(qty * trim.unitPriceCents)
+        amountCents: Math.round(qty * trim.unitPriceCents),
+        priceId: `cons:${trim.id}`
       })
     }
   }
@@ -260,7 +265,8 @@ export function buildBom(project: Project, layout: LayoutResult, preset: Preset,
       qty,
       unit: l.unit,
       unitPriceCents: l.unitPriceCents,
-      amountCents: Math.round(qty * l.unitPriceCents)
+      amountCents: Math.round(qty * l.unitPriceCents),
+      priceId: `labor:${l.id}`
     })
   }
 

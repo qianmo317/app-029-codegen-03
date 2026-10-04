@@ -10,6 +10,7 @@ import { yuan } from './materials'
 import type { LayoutResult } from './layout'
 import { alignLabel, mountingLabel } from './layout'
 import type { Project } from './types'
+import { fmtDateTime, type QuoteDoc as ArchivedQuoteDoc } from './archive'
 
 export function bomGroupLabel(kind: string): string {
   switch (kind) {
@@ -40,7 +41,7 @@ export interface QuoteDoc {
   footer: string
 }
 
-export function buildQuoteDoc(project: Project, layout: LayoutResult, bom: BomResult, fontLabel: string): QuoteDoc {
+export function buildQuoteDoc(project: Project, layout: LayoutResult, bom: BomResult, fontLabel: string, priceNote?: string): QuoteDoc {
   const now = new Date()
   const valid = new Date(now.getTime() + 30 * 24 * 3600 * 1000)
   const fmt = (d: Date): string => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
@@ -68,7 +69,8 @@ export function buildQuoteDoc(project: Project, layout: LayoutResult, bom: BomRe
       `面板材料：${bom.panelMaterial.name}（${bom.panelMaterial.desc}）`,
       `亚克力拼版：${bom.nesting.sheetCount} 张 ${bom.sheet.spec}，利用率 ${(bom.nesting.utilization * 100).toFixed(1)}%`,
       `LED：布点长度 ${bom.led.perimeterTotalMm}mm，模组 ${bom.led.modules} 只，额定功率 ${bom.led.ratedW}W，建议电源 ${bom.led.suggestedPsu}`,
-      bom.led.note
+      bom.led.note,
+      priceNote ? `取价版本：${priceNote}` : ''
     ].filter((s) => !!s),
     footer: '本报价基于当前材料单价，有效期 30 天；含材料与加工费，不含安装与运输。'
   }
@@ -89,9 +91,9 @@ function esc(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 }
 
-/** 导出 Excel（.xls，Excel/WPS 可直接打开） */
-export function exportQuoteXls(project: Project, layout: LayoutResult, bom: BomResult, fontLabel: string, compare: CompareRow[]): void {
-  const doc = buildQuoteDoc(project, layout, bom, fontLabel)
+/** 导出 Excel（.xls，Excel/WPS 可直接打开）；priceNote 为取价版本说明（按当天生效的价目版本取价） */
+export function exportQuoteXls(project: Project, layout: LayoutResult, bom: BomResult, fontLabel: string, compare: CompareRow[], priceNote?: string): void {
+  const doc = buildQuoteDoc(project, layout, bom, fontLabel, priceNote)
   const table = `
   <table border="1">
     <tr><th colspan="6">${esc(doc.title)}</th></tr>
@@ -128,10 +130,11 @@ export function exportQuoteXls(project: Project, layout: LayoutResult, bom: BomR
 }
 
 /** 导出工艺卡（CSV，供车间流转；PDF 走浏览器打印） */
-export function exportProcessCardCsv(project: Project, layout: LayoutResult, bom: BomResult, fontLabel: string): void {
+export function exportProcessCardCsv(project: Project, layout: LayoutResult, bom: BomResult, fontLabel: string, priceNote?: string): void {
   const lines: string[] = []
   lines.push('招牌字工艺卡')
   lines.push(`项目,${project.name}`)
+  if (priceNote) lines.push(`取价版本,${priceNote}`)
   lines.push(`门头,${project.layout.panel.wMm}×${project.layout.panel.hMm}mm 边框${project.layout.panel.frameMm}mm`)
   lines.push(`字体,${fontLabel} 字重${project.layout.settings.weight} 字号${layout.sizeMm}mm`)
   lines.push(`排版,${alignLabel(project.layout.settings.align)} 占宽${layout.occupiedW}mm 占高${layout.occupiedH}mm`)
@@ -161,4 +164,33 @@ export function exportProcessCardCsv(project: Project, layout: LayoutResult, bom
   lines.push(`板数,${bom.nesting.sheetCount}`)
   lines.push(`利用率,${(bom.nesting.utilization * 100).toFixed(1)}%`)
   download(`${project.name || '招牌'}工艺卡.csv`, new Blob([`\ufeff${lines.join('\n')}`], { type: 'text/csv;charset=utf-8' }))
+}
+
+/**
+ * 导出归档单据（CSV）：金额一律按单据里冻结的明细行取价（出单当天生效的价目版本），
+ * 重算单按其重算时的价目版本；不重算、不回填，原样导出。
+ */
+export function exportQuoteDocCsv(doc: ArchivedQuoteDoc, versionText: string): void {
+  const lines: string[] = []
+  lines.push('招牌字制作报价单（归档）')
+  lines.push(`单据号,${doc.id}`)
+  lines.push(`项目,${doc.projectName}`)
+  lines.push(`客户,${doc.customer || '（未填写）'}`)
+  lines.push(`出单时间,${fmtDateTime(doc.issuedAt)}`)
+  lines.push(`取价版本,${versionText}`)
+  lines.push(`来源,${doc.source === 'recomputed' ? `重算单（按原单 ${doc.recomputedFromId ?? ''} 用量 × 重算时价目重算，原单保留不变）` : '正式出单（冻结出单当时价目）'}`)
+  if (doc.note) lines.push(`备注,${doc.note}`)
+  lines.push('')
+  lines.push('类别,规格/说明,数量,单位,单价(元),金额(元)')
+  for (const r of doc.rows) {
+    lines.push(
+      [bomGroupLabel(r.kind || 'labor'), r.spec, String(r.qty), r.unit, yuan(r.unitPriceCents), yuan(r.amountCents)]
+        .map((s) => (s.includes(',') ? `"${s}"` : s))
+        .join(',')
+    )
+  }
+  lines.push(`,,,,合计,${yuan(doc.totalCents)}`)
+  lines.push('')
+  lines.push('金额单位：整数「分」折算为元（两位小数）；Σ 明细 = 合计。')
+  download(`${doc.customer ? `${doc.customer}-` : ''}${doc.projectName || '招牌'}报价单-${doc.id}.csv`, new Blob([`﻿${lines.join('\n')}`], { type: 'text/csv;charset=utf-8' }))
 }

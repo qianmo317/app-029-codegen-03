@@ -8,6 +8,17 @@ import { computeLed } from './led'
 import { clearGeometryCache, ensureFont, findFont, getGlyphGeom } from './fontLoader'
 import { computeLayout, defaultProject, textToItems, type LayoutResult } from './layout'
 import { assertBomSum, buildBom, compareMaterials, defaultPreset, type Preset } from './materials'
+import {
+  diffQuoteDocs,
+  issueQuoteDoc,
+  listPriceVersions,
+  listQuoteDocs,
+  normalizeDoc,
+  recordPriceChange,
+  recomputeQuoteDoc,
+  saveQuoteDoc,
+  type QuoteDoc
+} from './archive'
 import { nestPieces, type Piece } from './nesting'
 import { runBlockCount, type BlockCountResult } from './testRunner'
 import type { LayoutDef, Project } from './types'
@@ -375,6 +386,117 @@ export async function runAcceptance(preset: Preset = defaultPreset): Promise<Acc
       pass: cmp.every((c) => c.totalCents === c.panelCents + c.ledCents + c.psuCents + c.accessoryCents + c.laborCents),
       detail: `${cmp.length} 种材质`,
       evidence: cmp.map((c) => `${c.name}：面板 ${(c.panelCents / 100).toFixed(2)} + LED ${(c.ledCents / 100).toFixed(2)} + 电源 ${(c.psuCents / 100).toFixed(2)} + 配件 ${(c.accessoryCents / 100).toFixed(2)} + 加工 ${(c.laborCents / 100).toFixed(2)} = ¥${(c.totalCents / 100).toFixed(2)}`)
+    })
+  }
+
+  // ---------- 11. 报价归档（改价留痕 / 出单冻结 / 对比配平 / 旧单重算 / 兼容） ----------
+  {
+    const keyV = 'app029.selftest.priceVersions.v1'
+    const keyD = 'app029.selftest.quoteDocs.v1'
+    const ev: string[] = []
+    let pass = true
+    const chk = (ok: boolean, text: string): void => {
+      pass = pass && ok
+      ev.push(`${ok ? '✓' : '✗'} ${text}`)
+    }
+    try {
+      localStorage.removeItem(keyV)
+      localStorage.removeItem(keyD)
+      const p1 = JSON.parse(JSON.stringify(preset)) as Preset
+      const p2 = JSON.parse(JSON.stringify(preset)) as Preset
+      p2.labor[0].unitPriceCents += 500 // 加工费改价
+      p2.acrylicSheets[0].priceCents += 1234 // 板材改价
+
+      const proj = makeProject('acc11', '广告招牌制作', 300)
+      proj.customer = '测试客户'
+      const lay = computeLayout(proj.layout, { autoSize: true })
+
+      // 1) 出单冻结：按 p1 价目出单，自动建立「当天生效」的基线版
+      const bom1 = buildBom(proj, lay, p1)
+      const docA = issueQuoteDoc(proj, bom1, p1, keyV)
+      chk(saveQuoteDoc(docA, keyD), '出单归档写入本机存储（localStorage）')
+      const v1id = docA.priceVersionId
+      chk(listPriceVersions(keyV).length === 1 && v1id !== null, '首次出单自动归档第 1 版价目（出单当天生效版本）')
+
+      // 2) 改价留痕：改前价目已在档，改完再存一份新的
+      const v2 = recordPriceChange(p1, p2, keyV)
+      const versions = listPriceVersions(keyV)
+      chk(
+        versions.length === 2 && v2 !== null && v2.changes.length === 2,
+        `改价后共 ${versions.length} 版：改前价目（第 1 版）+ 改后价目（第 2 版，记录 ${v2?.changes.length ?? 0} 项单价改动）`
+      )
+      recordPriceChange(p2, p2, keyV)
+      chk(listPriceVersions(keyV).length === 2, '价目无实际变化时不产生新版本')
+
+      // 3) 已出单据不受改价影响
+      const docAReloaded = listQuoteDocs(keyD).find((d) => d.id === docA.id)
+      chk(
+        !!docAReloaded && docAReloaded.totalCents === docA.totalCents && docAReloaded.priceVersionId === v1id,
+        `改价后原单仍是 ¥${(docA.totalCents / 100).toFixed(2)}，取价版本仍指向第 1 版（冻结）`
+      )
+
+      // 4) 新价目出第二单：逐项对比，只改了单价 → 用量差合计为 0，总价差全在单价差
+      const bom2 = buildBom(proj, lay, p2)
+      const docB = issueQuoteDoc(proj, bom2, p2, keyV)
+      saveQuoteDoc(docB, keyD)
+      const d1 = diffQuoteDocs(docA, docB)
+      chk(
+        d1.balanced && d1.qtyEffectTotalCents === 0 && d1.priceEffectTotalCents === docB.totalCents - docA.totalCents,
+        `只改单价：总价差 ${d1.amountDiffTotalCents} 分 = 用量差 ${d1.qtyEffectTotalCents} + 单价差 ${d1.priceEffectTotalCents}（配平到分）`
+      )
+
+      // 5) 构造一张改了用量的单：该行单价差为 0、用量差 = 金额差，全单配平
+      const docC: QuoteDoc = JSON.parse(JSON.stringify(docA))
+      docC.id = 'docC-test'
+      const rowC = docC.rows.find((r) => r.priceId === 'cons:screw') ?? docC.rows[0]
+      rowC.qty += 2
+      rowC.amountCents = Math.round(rowC.qty * rowC.unitPriceCents)
+      docC.totalCents = docC.rows.reduce((s, r) => s + r.amountCents, 0)
+      const d2 = diffQuoteDocs(docA, docC)
+      const lineC = d2.lines.find((l) => l.key === rowC.priceId)
+      chk(
+        d2.balanced && !!lineC && lineC.priceEffectCents === 0 && lineC.qtyEffectCents === lineC.amountB - lineC.amountA,
+        `只改用量（${rowC.spec} +2${rowC.unit}）：该行单价差 0、用量差 ${lineC?.qtyEffectCents ?? '-'} 分 = 金额差，全单配平=${d2.balanced}`
+      )
+
+      // 6) 旧单重算：无归档信息的单按原用量 × 当前价目重算一版，原单不动
+      const legacy = normalizeDoc({ ...docA, id: 'legacy-1', priceVersionId: null, source: undefined, schema: 0 })
+      const recomputed = recomputeQuoteDoc(legacy, p2, keyV)
+      chk(
+        recomputed.source === 'recomputed' && recomputed.recomputedFromId === 'legacy-1' && recomputed.totalCents === docB.totalCents,
+        `旧单重算：合计 ${recomputed.totalCents} 分 = 同用量按新价目出的单 ${docB.totalCents} 分；来源标注「重算」`
+      )
+      const after = listQuoteDocs(keyD).find((d) => d.id === docA.id)
+      chk(!!after && after.totalCents === docA.totalCents, '重算后原单仍是原值（没有盖掉原单）')
+
+      // 7) 价目条目被删：重算时保留原单价并标注
+      const p3 = JSON.parse(JSON.stringify(p2)) as Preset
+      const removedId = `labor:${p3.labor[0].id}`
+      p3.labor.splice(0, 1)
+      const rec2 = recomputeQuoteDoc(legacy, p3, keyV)
+      const staleRow = rec2.rows.find((r) => r.priceId === removedId)
+      const origRow = docA.rows.find((r) => r.priceId === removedId)
+      chk(
+        !!staleRow && staleRow.stale === true && !!origRow && staleRow.unitPriceCents === origRow.unitPriceCents,
+        `条目已删（${origRow?.spec ?? removedId}）：重算保留原单价 ${origRow?.unitPriceCents ?? '-'} 分并标注「当前价目已删除」`
+      )
+
+      // 8) 兼容：缺字段 / 坏明细 / 带未知字段的旧存档都能打开
+      const weird = normalizeDoc({ id: 'old-1', rows: 'not-an-array', futureField: { x: 1 } }) as QuoteDoc & { futureField?: unknown }
+      chk(
+        weird.rows.length === 0 && weird.totalCents === 0 && weird.source === 'issued' && !!weird.futureField,
+        '旧存档兼容：缺字段给默认值、坏明细不崩、未知字段原样保留'
+      )
+    } finally {
+      localStorage.removeItem(keyV)
+      localStorage.removeItem(keyD)
+    }
+    checks.push({
+      id: 'A11',
+      title: '报价归档：改价留痕（改前/改后各存一份）、出单冻结、逐项对比配平到分、旧单重算不盖原单、旧存档兼容',
+      pass,
+      detail: pass ? '通过' : '存在未通过项',
+      evidence: ev
     })
   }
 

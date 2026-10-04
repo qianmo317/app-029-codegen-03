@@ -6,6 +6,7 @@ import { findFont } from '../logic/fontLoader'
 import { alignLabel } from '../logic/layout'
 import { assertBomSum, buildBom, compareMaterials, yuan } from '../logic/materials'
 import { bomGroupLabel, exportProcessCardCsv } from '../logic/quote'
+import { ensureCurrentVersion, fmtDateTime } from '../logic/archive'
 import { getProject } from '../logic/store'
 import { useSession } from '../logic/useSession'
 import type { Project } from '../logic/types'
@@ -43,7 +44,10 @@ function applySheet(id: string): void {
 
 function processCard(): void {
   if (project.value && layout.value && bom.value) {
-    exportProcessCardCsv(project.value, layout.value, bom.value, findFont(project.value.layout.settings.fontId)?.family ?? '')
+    // 材料清单按「当天生效的价目版本」取价：导出前确保版本已归档，并把版本号写进文件
+    const v = ensureCurrentVersion(preset.value)
+    const priceNote = `第 ${v.seq} 版价目（${fmtDateTime(v.createdAt)} 生效）`
+    exportProcessCardCsv(project.value, layout.value, bom.value, findFont(project.value.layout.settings.fontId)?.family ?? '', priceNote)
   }
 }
 </script>

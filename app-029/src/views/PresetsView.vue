@@ -13,8 +13,10 @@ const running = ref(false)
 const dirty = computed(() => JSON.stringify(preset.value) !== JSON.stringify(loadPreset()))
 
 function save(): void {
-  savePreset(preset.value)
-  saved.value = `已保存（${new Date().toLocaleTimeString('zh-CN')}）`
+  const version = savePreset(preset.value)
+  saved.value = version
+    ? `已保存；单价有 ${version.changes.length} 项改动，改前价目已留档，改后价目归档为第 ${version.seq} 版（见「报价归档」页）`
+    : `已保存（${new Date().toLocaleTimeString('zh-CN')}，单价无变化，不产生新价目版本）`
 }
 
 function reset(): void {
@@ -67,7 +69,11 @@ function removeSheet(i: number): void {
           <button @click="restoreDefaults">载入出厂默认</button>
           <button class="danger" @click="reset">恢复默认并保存</button>
           <span class="tag" v-if="dirty">有未保存改动</span>
+          <router-link to="/archive" class="muted" style="margin-left: auto">价目版本与历史单据 →</router-link>
         </div>
+        <p class="muted" style="margin: 6px 0 0">
+          材料/加工单价改动保存时会自动归档：先把当时那一份价目存下来，改完再存一份新的；已出单据按出单当时的价目原样保留。
+        </p>
 
         <h3 style="margin-top: 14px">工艺参数</h3>
         <div class="field">

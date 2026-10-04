@@ -6,6 +6,7 @@ import { buildQuoteDoc, exportQuoteXls, exportProcessCardCsv } from '../logic/qu
 import { assertBomSum, buildBom, compareMaterials, yuan } from '../logic/materials'
 import { alignLabel, mountingLabel } from '../logic/layout'
 import { getProject } from '../logic/store'
+import { ensureCurrentVersion, fmtDateTime, issueQuoteDoc, listPriceVersions, saveQuoteDoc, type QuoteDoc as ArchivedQuoteDoc } from '../logic/archive'
 import { useSession } from '../logic/useSession'
 import type { Project } from '../logic/types'
 
@@ -18,6 +19,16 @@ const preset = session.preset
 const ack = ref(false)
 const mode = ref<'quote' | 'card'>('quote')
 const printed = ref(false)
+const issued = ref<ArchivedQuoteDoc | null>(null)
+const issueError = ref('')
+const versionTick = ref(0)
+
+const customer = computed({
+  get: () => loaded.value?.customer ?? '',
+  set: (v: string) => {
+    if (loaded.value) loaded.value.customer = v
+  }
+})
 
 const bom = computed(() =>
   project.value && layout.value ? buildBom(project.value, layout.value, preset.value, { acknowledgeThinStroke: ack.value }) : null
@@ -28,29 +39,58 @@ const fontLabel = computed(() => {
   const f = findFont(p.layout.settings.fontId)
   return f ? `${f.label}（${f.family}）` : ''
 })
+/** 当前生效的价目版本说明（只读；出单/导出时会确保版本存在） */
+const priceNote = computed(() => {
+  void versionTick.value
+  const vs = listPriceVersions()
+  const latest = vs[vs.length - 1]
+  return latest ? `第 ${latest.seq} 版价目（${fmtDateTime(latest.createdAt)} 生效）` : ''
+})
 const doc = computed(() =>
-  project.value && layout.value && bom.value ? buildQuoteDoc(project.value, layout.value, bom.value, fontLabel.value) : null
+  project.value && layout.value && bom.value ? buildQuoteDoc(project.value, layout.value, bom.value, fontLabel.value, priceNote.value) : null
 )
 const sum = computed(() => (bom.value ? assertBomSum(bom.value) : null))
 const compare = computed(() =>
   project.value && layout.value && bom.value ? compareMaterials(project.value, layout.value, preset.value, bom.value) : []
 )
 
+/** 导出/出单前确保「当天生效的价目版本」已归档，并刷新界面上的版本说明 */
+function ensureVersion(): void {
+  ensureCurrentVersion(preset.value)
+  versionTick.value++
+}
+
 function printNow(): void {
+  ensureVersion()
   printed.value = true
   window.print()
 }
 
 function toExcel(): void {
   if (project.value && layout.value && bom.value) {
-    exportQuoteXls(project.value, layout.value, bom.value, fontLabel.value, compare.value)
+    ensureVersion()
+    exportQuoteXls(project.value, layout.value, bom.value, fontLabel.value, compare.value, priceNote.value)
   }
 }
 
 function toCsv(): void {
   if (project.value && layout.value && bom.value) {
-    exportProcessCardCsv(project.value, layout.value, bom.value, fontLabel.value)
+    ensureVersion()
+    exportProcessCardCsv(project.value, layout.value, bom.value, fontLabel.value, priceNote.value)
   }
+}
+
+/** 出单归档：把当前报价连同「当天生效的价目版本」一起冻结，之后改价不影响它 */
+function issue(): void {
+  issueError.value = ''
+  if (!project.value || !bom.value || bom.value.blocked) return
+  const archived = issueQuoteDoc(project.value, bom.value, preset.value)
+  if (!saveQuoteDoc(archived)) {
+    issueError.value = '归档写入失败：本机存储空间不足，请先在「报价归档」页清理旧版本后再试。'
+    return
+  }
+  issued.value = archived
+  versionTick.value++
 }
 </script>
 
@@ -72,6 +112,20 @@ function toCsv(): void {
         </div>
         <span class="muted">打印时只输出下方单据（页眉导航自动隐藏）</span>
       </div>
+
+      <div class="row no-print" style="margin-bottom: 12px">
+        <label class="muted">客户名称</label>
+        <input type="text" v-model="customer" placeholder="归档后按客户检索" style="width: 160px" />
+        <button class="primary" :disabled="bom?.blocked" @click="issue">出单归档（冻结当前价目）</button>
+        <router-link to="/archive"><button>报价归档 / 历史单据对比 →</button></router-link>
+        <span class="muted" v-if="priceNote">当前取价：{{ priceNote }}</span>
+        <span class="muted" v-else>尚未建立价目归档（首次改价或出单时自动建立）</span>
+      </div>
+      <div v-if="issued" class="banner ok no-print">
+        已归档为单据 {{ issued.id }}（{{ fmtDateTime(issued.issuedAt) }}，合计 ¥{{ yuan(issued.totalCents) }}）；
+        之后改价不影响该单，可到「报价归档」页按客户/时间段查询并与其他单据逐项对比。
+      </div>
+      <div v-if="issueError" class="banner bad no-print">{{ issueError }}</div>
 
       <div v-if="bom?.blocked" class="banner bad no-print">
         <b>工艺风险拦截：</b>{{ bom.blockReasons.join('；') }}
